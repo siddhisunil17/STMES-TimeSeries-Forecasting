@@ -1,0 +1,598 @@
+---
+title: "Foodborne Illness Time Series Forecasting"
+output: html_document
+---
+This project forecasts monthly foodborne illness counts using time series models like ARIMA, Prophet and machine learning Random Forest. Evaluation include the RMSE, MAE, change-point detection, lead time analysis, and outbreak classification accuracy.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(changepoint)
+library(prophet)
+library(feasts)
+library(fable)
+library(fabletools)
+library(Metrics)
+library(plotly)
+library(tidymodels)
+library(randomForest)
+library(skimr)
+library(tibble)
+library(yardstick)
+library(vip)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+food_data_clean <- read_csv("/Users/mruduladeshmukh/Downloads/outbreaks_clean (1).csv", show_col_types = FALSE)
+
+glimpse(food_data_clean)
+
+```
+
+```{r}
+sum(food_data_clean$Illnesses == 0)
+
+food_data_clean <- food_data_clean %>%
+  filter(Illnesses > 0)
+```
+
+
+```{r}
+monthly_illness <- food_data_clean %>%
+  group_by(Date) %>%
+  summarise(Total_Illnesses = sum(Illnesses, na.rm = TRUE)) %>%
+  arrange(Date)
+```
+
+
+```{r}
+illness_ts <- ts(monthly_illness$Total_Illnesses,
+                 start = c(year(min(monthly_illness$Date)), month(min(monthly_illness$Date))),
+                 frequency = 12)
+```
+
+
+```{r}
+head(monthly_illness)
+```
+
+
+
+```{r}
+decomp <- stl(illness_ts, s.window = "periodic")
+```
+
+```{r}
+autoplot(decomp) +
+  ggtitle("STL Decomposition of Monthly Illnesses") +
+  theme_minimal()
+```
+```{r}
+adf_test <- adf.test(illness_ts)
+print(adf_test)
+```
+
+We apply the PELT algorithm using the `changepoint` package to detect structural changes (e.g., outbreaks or shifts) in the time series. For each segment between change points, we fit a separate ARIMA model to understand the local behavior.
+
+```{r}
+cpt_result <- cpt.meanvar(illness_ts, method = "PELT")
+plot(cpt_result, main = "Detected Change Points")
+cp_indices <- c(0, cpts(cpt_result), length(illness_ts))
+segment_models <- list()
+for (i in 1:(length(cp_indices) - 1)) {
+  start_idx <- cp_indices[i] + 1
+  end_idx <- cp_indices[i + 1]
+  
+  if (start_idx >= end_idx) {
+    cat(paste0("⚠️ Skipping segment ", i, ": invalid index (", start_idx, " > ", end_idx, ")\n"))
+    next
+  }
+
+  segment_ts <- illness_ts[start_idx:end_idx]
+  
+  model <- auto.arima(segment_ts)
+  segment_models[[i]] <- model
+  
+  cat(paste0("Segment ", i, ": Index ", start_idx, " to ", end_idx, "\n"))
+  print(summary(model))
+}
+```
+```{r}
+final_model <- segment_models[[length(segment_models)]]
+forecast_last <- forecast(final_model, h = 12)
+
+autoplot(forecast_last) +
+  ggtitle("Forecast from Last Change-Point Segment ARIMA") +
+  theme_minimal()
+```
+
+
+```{r}
+arima_model <- auto.arima(illness_ts)
+summary(arima_model)
+```
+
+
+```{r}
+forecast_illness <- forecast(arima_model, h = 12)
+```
+
+```{r}
+autoplot(forecast_illness) +
+  ggtitle("Forecast of Foodborne Illnesses for Next 12 Months") +
+  xlab("Year") +
+  ylab("Predicted Illnesses")
+```
+
+
+```{r}
+checkresiduals(arima_model)
+```
+
+
+```{r}
+prophet_df <- monthly_illness %>%
+  rename(ds = Date, y = Total_Illnesses)
+```
+
+
+```{r}
+m <- prophet(prophet_df, weekly.seasonality = FALSE, daily.seasonality = FALSE)
+```
+
+
+
+```{r}
+future <- make_future_dataframe(m, periods = 12, freq = "month")
+forecast_prophet <- predict(m, future)
+```
+
+```{r}
+plot(m, forecast_prophet) +
+  ggtitle("Prophet Forecast for Foodborne Illnesses")
+```
+
+```{r}
+actual_df <- monthly_illness %>%
+  rename(ds = Date, y = Total_Illnesses) %>%
+  mutate(model = "Actual")
+```
+
+```{r}
+arima_forecast <- forecast(arima_model, h = 12)
+arima_df <- data.frame(
+  ds = seq(max(monthly_illness$Date) + 1, by = "month", length.out = 12),
+  y = as.numeric(arima_forecast$mean),
+  model = "ARIMA"
+)
+```
+
+```{r}
+prophet_df_future <- forecast_prophet %>%
+  filter(as.Date(ds) > max(as.Date(actual_df$ds))) %>%
+  select(ds, y = yhat) %>%
+  mutate(model = "Prophet")
+```
+
+
+
+```{r}
+combined <- bind_rows(actual_df, arima_df, prophet_df_future)
+```
+
+```{r}
+ggplot(combined, aes(x = ds, y = y, color = model)) +
+  geom_line(size = 1) +
+  labs(title = "Comparison of Forecasts: ARIMA vs Prophet",
+       x = "Date", y = "Illness Count", color = "Model") +
+  theme_minimal()
+```
+
+
+```{r}
+train_data <- head(monthly_illness, -12)
+test_data <- tail(monthly_illness, 12)
+test_values <- test_data$Total_Illnesses
+```
+
+
+```{r}
+illness_ts_train <- ts(train_data$Total_Illnesses,
+                       start = c(year(min(train_data$Date)), month(min(train_data$Date))),
+                       frequency = 12)
+```
+
+```{r}
+arima_model <- auto.arima(illness_ts_train)
+arima_forecast <- forecast(arima_model, h = 12)
+arima_pred <- as.numeric(arima_forecast$mean)
+```
+
+```{r}
+prophet_train <- train_data %>%
+  rename(ds = Date, y = Total_Illnesses)
+```
+
+```{r}
+m <- prophet(prophet_train, weekly.seasonality = FALSE, daily.seasonality = FALSE)
+```
+
+```{r}
+future <- make_future_dataframe(m, periods = 12, freq = "month")
+forecast_prophet <- predict(m, future)
+```
+
+```{r}
+prophet_pred <- tail(forecast_prophet$yhat, 12)
+```
+
+```{r}
+metrics_df <- tibble(
+  truth = test_values,
+  .pred = arima_pred
+)
+```
+
+```{r}
+rmse_arima <- rmse(metrics_df, truth = truth, estimate = .pred)
+mae_arima  <- mae(metrics_df, truth = truth, estimate = .pred)
+```
+
+```{r}
+metrics_prophet <- tibble(
+  truth = test_values,
+  .pred = prophet_pred
+)
+rmse_prophet <- rmse(metrics_prophet, truth = truth, estimate = .pred)
+mae_prophet <- mae(metrics_prophet, truth = truth, estimate = .pred)
+```
+
+```{r}
+print(rmse_arima)
+print(mae_arima)
+print(rmse_prophet)
+print(mae_prophet)
+```
+
+```{r}
+arima_peak_index <- which.max(arima_pred)
+prophet_peak_index <- which.max(prophet_pred)
+
+actual_peak_index <- which.max(test_values)
+
+lead_time_arima <- actual_peak_index - arima_peak_index
+lead_time_prophet <- actual_peak_index - prophet_peak_index
+
+lead_time_tbl <- tibble(
+  Model = c("ARIMA", "Prophet"),
+  Predicted_Peak = c(arima_peak_index, prophet_peak_index),
+  Actual_Peak = actual_peak_index,
+  Lead_Time = c(lead_time_arima, lead_time_prophet)
+)
+print(lead_time_tbl)
+```
+
+```{r}
+compare_df <- data.frame(
+  Date = test_data$Date,
+  Actual = test_values,
+  ARIMA = arima_pred,
+  Prophet = prophet_pred
+)
+```
+
+```{r}
+compare_df_long <- compare_df %>%
+  pivot_longer(cols = c("Actual", "ARIMA", "Prophet"), names_to = "Model", values_to = "Value")
+```
+
+```{r}
+ggplot(compare_df_long, aes(x = Date, y = Value, color = Model)) +
+  geom_line(size = 1) +
+  labs(title = "Actual vs Forecast (ARIMA vs Prophet)", y = "Illness Count") +
+  theme_minimal()
+```
+
+```{r}
+threshold <- mean(test_values) + sd(test_values)
+classification_df <- tibble(
+  truth = ifelse(test_values > threshold, 1, 0),
+  ARIMA = ifelse(arima_pred > threshold, 1, 0),
+  Prophet = ifelse(prophet_pred > threshold, 1, 0)
+)
+
+classification_long <- classification_df %>%
+  pivot_longer(cols = c(ARIMA, Prophet), names_to = "Model", values_to = ".pred_class") %>%
+  mutate(
+    .truth = factor(truth, levels = c(0, 1)),
+    .pred_class = factor(.pred_class, levels = c(0, 1))
+  )
+
+classification_metrics <- classification_long %>%
+  group_by(Model) %>%
+  summarise(
+    Sensitivity = sensitivity_vec(.truth, .pred_class),
+    Specificity = specificity_vec(.truth, .pred_class),
+    Accuracy = accuracy_vec(.truth, .pred_class)
+  )
+print(classification_metrics)
+```
+
+
+```{r}
+df_prophet <- monthly_illness %>%
+
+  select(Date, Total_Illnesses) %>%
+  rename(ds = Date, y = Total_Illnesses)
+```
+
+```{r}
+m <- prophet(df_prophet, weekly.seasonality = FALSE, daily.seasonality = FALSE)
+future <- make_future_dataframe(m, periods = 12, freq = "month")
+forecast_prophet <- predict(m, future)
+```
+
+```{r}
+prophet_df_forecast <- forecast_prophet %>%
+  tail(12) %>%
+  select(ds, yhat) %>%
+  mutate(ds = floor_date(as.Date(ds), unit = "month"), model = "Prophet") %>%
+  rename(y = yhat)
+```
+
+```{r}
+actual_df <- df_prophet %>%
+  mutate(model = "Actual")
+```
+
+```{r}
+forecast_arima <- forecast(arima_model, h = 12)
+arima_forecast_df <- data.frame(
+  ds = seq(from = as.Date(max(df_prophet$ds)) + 1, by = "month", length.out = 12),
+  y = as.numeric(forecast_arima$mean),
+  model = "ARIMA"
+)
+```
+
+```{r}
+combined_df <- bind_rows(actual_df, arima_forecast_df, prophet_df_forecast)
+```
+
+```{r}
+ggplot(combined_df, aes(x = ds, y = y, color = model)) +
+  geom_line(size = 1) +  # unified line styling for all models
+  labs(title = "Forecast Comparison: ARIMA vs Prophet vs Actual",
+       x = "Date", y = "Illness Count", color = "Model") +
+  theme_minimal()
+```
+
+
+```{r}
+arima_df <- data.frame(
+  ds = seq(from = as.Date("2015-01-01"), by = "month", length.out = 12),
+  arima = as.numeric(arima_forecast$mean[1:12])
+)
+```
+
+
+```{r}
+prophet_df_forecast <- forecast_prophet %>%
+  mutate(ds = floor_date(as.Date(ds), unit = "month")) %>%
+  filter(ds >= as.Date("2015-01-01") & ds <= as.Date("2015-12-01")) %>%
+  group_by(ds) %>%
+  summarise(prophet = mean(yhat)) %>%
+  ungroup()
+```
+
+```{r}
+actual_df <- monthly_illness %>%
+  mutate(ds = floor_date(Date, unit = "month")) %>%
+  group_by(ds) %>%
+  summarise(actual = sum(Total_Illnesses, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(ds >= as.Date("2015-01-01") & ds <= as.Date("2015-12-01"))
+```
+
+
+```{r}
+compare_df <- actual_df %>%
+  inner_join(arima_df, by = "ds") %>%
+  inner_join(prophet_df_forecast, by = "ds")
+```
+
+```{r}
+print(compare_df)
+```
+
+```{r}
+rmse_arima <- sqrt(mean((compare_df$arima - compare_df$actual)^2))
+mae_arima  <- mean(abs(compare_df$arima - compare_df$actual))
+```
+
+```{r}
+rmse_prophet <- sqrt(mean((compare_df$prophet - compare_df$actual)^2))
+mae_prophet  <- mean(abs(compare_df$prophet - compare_df$actual))
+```
+
+```{r}
+cat("ARIMA:   RMSE =", round(rmse_arima, 2), "  MAE =", round(mae_arima, 2), "\n")
+cat("Prophet: RMSE =", round(rmse_prophet, 2), "  MAE =", round(mae_prophet, 2), "\n")
+```
+
+
+```{r}
+ml_df <- food_data_clean %>%
+  select(Illnesses, Year, Month, State, Location, Species, Status) %>%
+  filter(!is.na(Illnesses)) %>%
+  mutate(across(where(is.character), as.factor))  
+
+ml_df <- ml_df %>%
+  filter(Illnesses < quantile(Illnesses, 0.99))  
+
+skim(ml_df)
+
+```
+
+```{r}
+set.seed(123)
+split <- initial_split(ml_df, prop = 0.8, strata = Illnesses)
+train_data <- training(split)
+test_data <- testing(split)
+```
+
+```{r}
+ml_recipe <- recipe(Illnesses ~ ., data = train_data) %>%
+  step_impute_median(all_numeric_predictors()) %>%     
+  step_impute_mode(all_nominal_predictors()) %>%       
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())                          
+```
+
+```{r}
+rf_model <- rand_forest(mtry = 5, trees = 500, min_n = 10) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+```
+
+```{r}
+rf_workflow <- workflow() %>%
+  add_recipe(ml_recipe) %>%
+  add_model(rf_model)
+
+rf_fit <- rf_workflow %>% fit(data = train_data)
+```
+
+```{r}
+rf_preds <- rf_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data)
+metrics(rf_preds, truth = Illnesses, estimate = .pred)
+```
+
+```{r}
+illness_full <- food_data_clean %>%
+  group_by(Date) %>%
+  summarise(Illnesses = sum(Illnesses, na.rm = TRUE)) %>%
+  mutate(
+    Year = year(Date),
+    Month = month(Date),
+    Month_Name = month(Date, label = TRUE),
+    Quarter = quarter(Date),
+    Season = case_when(
+      Month %in% c(12, 1, 2) ~ "Winter",
+      Month %in% c(3, 4, 5) ~ "Spring",
+      Month %in% c(6, 7, 8) ~ "Summer",
+      Month %in% c(9, 10, 11) ~ "Fall"
+    )
+  ) %>%
+  ungroup()
+
+illness_ml <- illness_full %>% select(-Date)
+```
+
+```{r}
+rf_spec <- rand_forest(mtry = 5, trees = 500, min_n = 10) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+
+rec <- recipe(Illnesses ~ ., data = illness_ml) %>%
+  step_impute_median(all_numeric(), -all_outcomes()) %>%
+  step_dummy(all_nominal_predictors())
+
+rf_workflow <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rec)
+
+rf_fit_final <- rf_workflow %>% fit(data = illness_ml)
+```
+
+```{r}
+rf_preds <- predict(rf_fit_final, new_data = illness_ml) %>%
+  bind_cols(illness_ml %>% select(Illnesses))
+
+metrics <- rf_preds %>%
+  metrics(truth = Illnesses, estimate = .pred)
+
+print(metrics)
+```
+
+```{r}
+vip::vip(rf_fit_final$fit$fit, num_features = 10) +
+  ggtitle("Top Predictive Features for Illnesses (Random Forest)")
+```
+
+```{r}
+rf_preds_plot <- predict(rf_fit_final, new_data = illness_ml) %>%
+  bind_cols(illness_full %>% select(Date, Illnesses))  # ← Date comes from full version
+
+ggplot(rf_preds_plot, aes(x = Date)) +
+  geom_line(aes(y = Illnesses, color = "Actual")) +
+  geom_line(aes(y = .pred, color = "Predicted")) +
+  labs(title = "Actual vs Predicted Illness Counts (RF)",
+       y = "Illnesses", x = "Date", color = "") +
+  theme_minimal()
+```
+
+```{r}
+set.seed(42)
+split <- initial_split(illness_ml, prop = 0.8)
+train_data <- training(split)
+test_data  <- testing(split)
+
+rf_fit_cv <- rf_workflow %>% fit(data = train_data)
+
+rf_test_preds <- predict(rf_fit_cv, new_data = test_data) %>%
+  bind_cols(test_data %>% select(Illnesses))
+
+metrics(rf_test_preds, truth = Illnesses, estimate = .pred)
+```
+
+
+
+
+```{r}
+comparison_df <- tibble(
+  truth = test_values,
+  ARIMA = arima_pred,
+  Prophet = prophet_pred,
+  Ensemble = (arima_pred + prophet_pred) / 2
+)
+
+comparison_long <- comparison_df %>%
+  tidyr::pivot_longer(-truth, names_to = "Model", values_to = ".pred")
+
+model_metrics <- comparison_long %>%
+  group_by(Model) %>%
+  summarise(
+    RMSE = rmse_vec(truth, .pred),
+    MAE = mae_vec(truth, .pred)
+  )
+print(model_metrics)
+```
+
+```{r}
+model_metrics_long <- model_metrics %>%
+  pivot_longer(cols = c(RMSE, MAE), names_to = "Metric", values_to = "Value")
+
+
+ggplot(model_metrics_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.2)) +
+  labs(title = "Model Comparison: RMSE and MAE",
+       x = "Model", y = "Error Value") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+
